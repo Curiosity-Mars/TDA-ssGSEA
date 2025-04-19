@@ -1,0 +1,626 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+GeneTDA-Net: ssGSEA Analysis Module for Bidirectional Comparison
+================================================================
+
+This script performs single-sample Gene Set Enrichment Analysis (ssGSEA) using community-based 
+gene sets for bidirectional comparison between healthy and disease states. It takes gene expression 
+data and community assignments from one condition and evaluates their enrichment in the other condition.
+
+This module can be used for:
+1. HEALTHY → DISEASE analysis: Applying communities identified in healthy samples to disease samples
+   (To understand how healthy-derived structures are perturbed in disease)
+2. DISEASE → HEALTHY analysis: Applying communities identified in disease samples to healthy samples
+   (To understand how disease-derived structures behave in healthy state)
+
+Key analysis steps:
+1. Import community structures from source condition (healthy OR disease)
+2. Convert community assignments to gene set format (.gmt)
+3. Run ssGSEA analysis on target condition samples using source condition gene sets
+4. Generate enrichment scores and interpretation summaries
+
+IMPORTANT FOR JOURNAL READERS:
+- To run either analysis direction, prepare your data following instructions in the main() function
+- The same code works for both directions by changing a few parameters (see implementation details)
+
+Author: [Your Name]
+Date: April 2025
+"""
+
+# ============================================
+# 📦 Required Library Imports
+# ============================================
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import gseapy as gp
+from collections import defaultdict
+import seaborn as sns
+
+# ============================================
+# 📊 Data Loading Functions
+# ============================================
+def load_expression_data(file_path, sample_ids=None):
+    """
+    Load and preprocess gene expression data.
+    
+    Parameters:
+    ----------
+    file_path : str
+        Path to the CSV file containing gene expression data
+    sample_ids : list
+        Optional list of sample IDs to filter the data
+        
+    Returns:
+    -------
+    pandas.DataFrame
+        Preprocessed gene expression data
+    """
+    print("📊 Loading gene expression data...")
+    
+    # Read CSV with UTF-8-BOM encoding
+    df = pd.read_csv(file_path, encoding="utf-8-sig")
+    
+    # Clean column names (remove .CEL suffix and whitespace)
+    df.columns = df.columns.str.strip().str.replace(".CEL", "", regex=False)
+    
+    # Set gene symbols as index and drop ID column if it exists
+    df.set_index("Gene Symbol", inplace=True)
+    df.drop(columns=["ID"], inplace=True, errors="ignore")
+    
+    # Convert to numeric values
+    df = df.apply(pd.to_numeric, errors="coerce")
+    
+    # Convert gene symbols to string type for consistency
+    df.index = df.index.astype(str)
+    
+    # Filter for selected samples if provided
+    if sample_ids is not None:
+        df = df[sample_ids]
+    
+    print(f"✅ Data loaded: {df.shape[0]} genes, {df.shape[1]} samples")
+    return df
+
+def load_community_assignments(file_path):
+    """
+    Load community assignment data from a CSV file.
+    
+    Parameters:
+    ----------
+    file_path : str
+        Path to the CSV file containing community assignments
+        
+    Returns:
+    -------
+    pandas.DataFrame
+        Community assignment data
+    """
+    print("🌐 Loading community assignments...")
+    
+    # Read CSV
+    df = pd.read_csv(file_path)
+    
+    # Ensure column names are standardized
+    if "Gene Symbol" not in df.columns and "GeneSymbol" in df.columns:
+        df.rename(columns={"GeneSymbol": "Gene Symbol"}, inplace=True)
+    elif "Gene Symbol" not in df.columns and "GENE SYMBOL" in df.columns:
+        df.rename(columns={"GENE SYMBOL": "Gene Symbol"}, inplace=True)
+    
+    if "Community" not in df.columns:
+        raise ValueError("Error: 'Community' column not found in the community assignment file")
+    
+    # Convert gene symbols to uppercase for better matching
+    df["Gene Symbol"] = df["Gene Symbol"].astype(str).str.upper()
+    
+    print(f"✅ Community data loaded: {df.shape[0]} genes across {df['Community'].nunique()} communities")
+    return df
+
+# ============================================
+# 🧬 Gene Set Creation Functions
+# ============================================
+def create_community_gene_sets(community_df, prefix="A"):
+    """
+    Create gene sets dictionary from community assignments.
+    
+    Parameters:
+    ----------
+    community_df : pandas.DataFrame
+        DataFrame with 'Gene Symbol' and 'Community' columns
+    prefix : str
+        Prefix for gene set names (default: "A" for analysis from normal to disease)
+        
+    Returns:
+    -------
+    dict
+        Dictionary of gene sets: {set_name: [genes]}
+    """
+    print("🧬 Creating community-based gene sets...")
+    
+    # Ensure required columns exist
+    if "Gene Symbol" not in community_df.columns or "Community" not in community_df.columns:
+        raise ValueError("Required columns 'Gene Symbol' and 'Community' not found")
+    
+    # Create gene sets for each community
+    gene_sets = {
+        f"{prefix}-{int(cid)+1}": group["Gene Symbol"].dropna().unique().tolist()
+        for cid, group in community_df.groupby("Community")
+    }
+    
+    # Count genes in each set
+    set_sizes = {name: len(genes) for name, genes in gene_sets.items()}
+    
+    print(f"✅ Created {len(gene_sets)} gene sets from communities")
+    print("Gene set sizes:", ", ".join([f"{name}: {size}" for name, size in set_sizes.items()]))
+    
+    return gene_sets
+
+def write_gmt_file(gene_sets, output_file):
+    """
+    Write gene sets to a GMT format file.
+    
+    Parameters:
+    ----------
+    gene_sets : dict
+        Dictionary of gene sets: {set_name: [genes]}
+    output_file : str
+        Path to save the GMT file
+        
+    Returns:
+    -------
+    str
+        Path to the created GMT file
+    """
+    print(f"📝 Writing gene sets to GMT file: {output_file}")
+    
+    # Write gene sets to GMT format
+    with open(output_file, "w", encoding="utf-8") as f:
+        for set_name, genes in gene_sets.items():
+            # Clean genes and ensure they're not empty
+            genes_clean = [str(g).strip() for g in genes if str(g).strip() != '']
+            if genes_clean:
+                f.write(f"{set_name}\tna\t" + "\t".join(genes_clean) + "\n")
+    
+    # Validate the file was created correctly
+    with open(output_file, "r", encoding="utf-8") as f:
+        line_count = sum(1 for _ in f)
+    
+    print(f"✅ GMT file created with {line_count} gene sets")
+    return output_file
+
+# ============================================
+# 📊 ssGSEA Analysis Functions
+# ============================================
+def run_ssgsea(expression_data, gene_sets, output_dir, method='rank', permutation_num=0):
+    """
+    Run single-sample Gene Set Enrichment Analysis.
+    
+    Parameters:
+    ----------
+    expression_data : pandas.DataFrame
+        Gene expression data with genes as index and samples as columns
+    gene_sets : dict or str
+        Dictionary of gene sets or path to GMT file
+    output_dir : str
+        Directory to save output files
+    method : str
+        Normalization method for ssGSEA (default: 'rank')
+    permutation_num : int
+        Number of permutations for statistical assessment (default: 0)
+        
+    Returns:
+    -------
+    gseapy.ssgsea
+        ssGSEA results object
+    """
+    print(f"🔬 Running ssGSEA analysis (output: {output_dir})...")
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Run ssGSEA
+    ssgsea_results = gp.ssgsea(
+        data=expression_data,
+        gene_sets=gene_sets,
+        sample_norm_method=method,
+        outdir=output_dir,
+        permutation_num=permutation_num,
+        no_plot=True,
+        threads=4,
+        format='png',
+        min_size=1,
+        verbose=True
+    )
+    
+    print(f"✅ ssGSEA analysis complete, results saved to {output_dir}")
+    return ssgsea_results
+
+def process_ssgsea_results(output_dir):
+    """
+    Process ssGSEA results into usable formats.
+    
+    Parameters:
+    ----------
+    output_dir : str
+        Directory containing ssGSEA output files
+        
+    Returns:
+    -------
+    tuple
+        (nes_wide, summary_df) - Wide format NES scores and summary statistics
+    """
+    print("📊 Processing ssGSEA results...")
+    
+    # Find and load the report file
+    report_files = [f for f in os.listdir(output_dir) if f.endswith(".ssgsea.report.csv")]
+    if not report_files:
+        raise FileNotFoundError(f"No ssGSEA report files found in {output_dir}")
+    
+    report_file = os.path.join(output_dir, report_files[0])
+    report_df = pd.read_csv(report_file)
+    
+    # Convert to wide format (samples as rows, gene sets as columns)
+    nes_wide = report_df.pivot(index="Name", columns="Term", values="NES")
+    
+    # Calculate summary statistics
+    summary_df = pd.DataFrame({
+        "Community": nes_wide.columns,
+        "ES_mean": nes_wide.mean(axis=0).values,
+        "ES_std": nes_wide.std(axis=0).values
+    })
+    
+    # Save processed results
+    nes_wide.to_csv(os.path.join(output_dir, "NES_WIDE_FORMAT.csv"))
+    summary_df.to_csv(os.path.join(output_dir, "NES_Summary_by_Community.csv"), index=False)
+    
+    print(f"✅ Processed results saved to {output_dir}")
+    return nes_wide, summary_df
+
+def interpret_enrichment_scores(summary_df, analysis_direction="H2D", output_dir="ssgsea_results"):
+    """
+    Add interpretations to enrichment score summaries.
+    
+    Parameters:
+    ----------
+    summary_df : pandas.DataFrame
+        DataFrame with summary statistics for each community
+    analysis_direction : str
+        Either "H2D" (Healthy→Disease) or "D2H" (Disease→Healthy)
+    output_dir : str
+        Directory to save output files
+        
+    Returns:
+    -------
+    pandas.DataFrame
+        Summary with added interpretation column
+    """
+    print("🧠 Adding interpretations to enrichment scores...")
+    
+    # Define interpretation function based on analysis direction
+    if analysis_direction == "H2D":
+        # Healthy → Disease interpretation
+        def interpret(es):
+            if es > 0.4:
+                return "↑ Strong activation in disease"
+            elif es > 0.1:
+                return "↑ Moderate activation"
+            elif es > -0.1:
+                return "→ Neutral"
+            elif es > -0.4:
+                return "↓ Mild suppression"
+            else:
+                return "↓ Strong suppression"
+    else:  # D2H
+        # Disease → Healthy interpretation
+        def interpret(es):
+            if es > 0.4:
+                return "↑ Strong activation in healthy"
+            elif es > 0.1:
+                return "↑ Moderate activation"
+            elif es > -0.1:
+                return "→ Neutral"
+            elif es > -0.4:
+                return "↓ Mild suppression"
+            else:
+                return "↓ Strong suppression"
+    
+    # Add interpretation column
+    summary_df = summary_df.copy()
+    summary_df["Interpretation"] = summary_df["ES_mean"].apply(interpret)
+    
+    # Save enhanced summary
+    summary_df.to_csv(os.path.join(output_dir, "NES_Summary_with_Interpretation.csv"), index=False)
+    
+    print("✅ Added interpretations to enrichment scores")
+    return summary_df
+
+# ============================================
+# 📈 Visualization Functions
+# ============================================
+def plot_enrichment_heatmap(nes_wide, output_file):
+    """
+    Create a heatmap of enrichment scores.
+    
+    Parameters:
+    ----------
+    nes_wide : pandas.DataFrame
+        Wide format NES scores (samples as rows, gene sets as columns)
+    output_file : str
+        Path to save the heatmap image
+        
+    Returns:
+    -------
+    matplotlib.figure.Figure
+        Heatmap figure
+    """
+    print("🎨 Creating enrichment score heatmap...")
+    
+    plt.figure(figsize=(12, 10))
+    sns.set(font_scale=1.2)
+    
+    # Create heatmap
+    ax = sns.heatmap(
+        nes_wide, 
+        cmap="RdBu_r",
+        center=0,
+        annot=False,
+        cbar_kws={"label": "Normalized Enrichment Score (NES)"}
+    )
+    
+    plt.title("Gene Set Enrichment Scores by Community", fontsize=16)
+    plt.xlabel("Community", fontsize=14)
+    plt.ylabel("Sample", fontsize=14)
+    plt.tight_layout()
+    
+    # Save figure
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"✅ Heatmap saved to {output_file}")
+    
+    return plt.gcf()
+
+def plot_community_enrichment_summary(summary_df, output_file, analysis_direction="H2D"):
+    """
+    Create a bar plot of mean enrichment scores for each community.
+    
+    Parameters:
+    ----------
+    summary_df : pandas.DataFrame
+        Summary statistics for each community
+    output_file : str
+        Path to save the bar plot image
+    analysis_direction : str
+        Either "H2D" (Healthy→Disease) or "D2H" (Disease→Healthy)
+        
+    Returns:
+    -------
+    matplotlib.figure.Figure
+        Bar plot figure
+    """
+    print("📊 Creating community enrichment summary plot...")
+    
+    plt.figure(figsize=(14, 8))
+    
+    # Create bar plot
+    bars = plt.bar(
+        summary_df["Community"],
+        summary_df["ES_mean"],
+        yerr=summary_df["ES_std"],
+        capsize=5,
+        color=[
+            'red' if es > 0.4 else
+            'salmon' if es > 0.1 else
+            'gray' if es > -0.1 else
+            'skyblue' if es > -0.4 else
+            'blue'
+            for es in summary_df["ES_mean"]
+        ]
+    )
+    
+    # Add horizontal line at y=0
+    plt.axhline(y=0, color='black', linestyle='-', alpha=0.3)
+    
+    # Add threshold lines
+    plt.axhline(y=0.4, color='red', linestyle='--', alpha=0.5)
+    plt.axhline(y=0.1, color='salmon', linestyle='--', alpha=0.5)
+    plt.axhline(y=-0.1, color='skyblue', linestyle='--', alpha=0.5)
+    plt.axhline(y=-0.4, color='blue', linestyle='--', alpha=0.5)
+    
+    # Add labels
+    plt.xlabel('Community', fontsize=14)
+    plt.ylabel('Mean Enrichment Score', fontsize=14)
+    
+    # Add title based on analysis direction
+    if analysis_direction == "H2D":
+        plt.title('Healthy-derived Community Enrichment in Disease Samples', fontsize=16)
+    else:  # D2H
+        plt.title('Disease-derived Community Enrichment in Healthy Samples', fontsize=16)
+    
+    # Add interpretation legend with appropriate labels
+    target_state = "disease" if analysis_direction == "H2D" else "healthy"
+    
+    plt.legend([
+        plt.Line2D([0], [0], color='red', lw=4),
+        plt.Line2D([0], [0], color='salmon', lw=4),
+        plt.Line2D([0], [0], color='gray', lw=4),
+        plt.Line2D([0], [0], color='skyblue', lw=4),
+        plt.Line2D([0], [0], color='blue', lw=4)
+    ], [
+        f'Strong activation in {target_state}',
+        'Moderate activation',
+        'Neutral',
+        'Mild suppression',
+        'Strong suppression'
+    ])
+    
+    plt.grid(axis='y', linestyle='--', alpha=0.3)
+    plt.tight_layout()
+    
+    # Save figure
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"✅ Summary plot saved to {output_file}")
+    
+    return plt.gcf()
+
+# ============================================
+# 🚀 Main Function
+# ============================================
+def main():
+    """
+    Main execution function.
+    
+    === FOR JOURNAL READERS ===
+    
+    This script supports bidirectional analysis between healthy and disease states:
+    
+    1. HEALTHY → DISEASE Analysis:
+       - SOURCE: Healthy samples' community structure
+       - TARGET: Disease samples' expression data
+       - INTERPRETATION: How healthy-derived communities behave in disease
+       - PREFIX: Use "A-" for gene set names
+       
+    2. DISEASE → HEALTHY Analysis:
+       - SOURCE: Disease samples' community structure
+       - TARGET: Healthy samples' expression data  
+       - INTERPRETATION: How disease-derived communities behave in healthy state
+       - PREFIX: Use "B-" for gene set names
+       
+    To use this code for your analysis:
+    1. Change the file paths to your data files
+    2. Update the sample IDs for your target condition
+    3. Set the analysis_direction variable to "H2D" or "D2H"
+    4. Run the script
+    """
+    
+    # ============================================
+    # 🔀 BIDIRECTIONAL ANALYSIS CONFIGURATION
+    # ============================================
+    
+    # Set analysis direction: "H2D" (Healthy→Disease) or "D2H" (Disease→Healthy)
+    analysis_direction = "H2D"  # CHANGE THIS TO "D2H" for reverse analysis
+    
+    # Configure paths and parameters
+    expression_file = "GSE11783normalized_merged_by_ID.csv"
+    
+    # Define sample IDs for both conditions
+    healthy_samples = [
+        "GSM298203", "GSM298204", "GSM298212",
+        "GSM298215", "GSM298216", "GSM298217"
+    ]
+    
+    disease_samples = [
+        "GSM298205", "GSM298207", "GSM298210", "GSM402541",
+        "GSM298206", "GSM298208", "GSM298209", "GSM298211", "GSM298214"
+    ]
+    
+    # === Configure analysis based on direction ===
+    if analysis_direction == "H2D":
+        # HEALTHY → DISEASE Analysis
+        community_file = "all_genes_community_assignment_healthy.csv"
+        target_samples = disease_samples
+        prefix = "A"
+        output_dir = "ssgsea_H2D_results"
+        title_source = "Healthy"
+        title_target = "Disease"
+    elif analysis_direction == "D2H":
+        # DISEASE → HEALTHY Analysis
+        community_file = "all_genes_community_assignment_disease.csv"
+        target_samples = healthy_samples
+        prefix = "B"
+        output_dir = "ssgsea_D2H_results"
+        title_source = "Disease"
+        title_target = "Healthy"
+    else:
+        raise ValueError("Invalid analysis direction. Use 'H2D' or 'D2H'.")
+    
+    print(f"🔀 Running {title_source} → {title_target} Analysis")
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # ============================================
+    # 📊 DATA LOADING
+    # ============================================
+    
+    # Load data
+    expression_data = load_expression_data(expression_file, target_samples)
+    community_data = load_community_assignments(community_file)
+    
+    # Create gene sets from communities
+    gene_sets = create_community_gene_sets(community_data, prefix=prefix)
+    
+    # Write gene sets to GMT file
+    gmt_file = write_gmt_file(gene_sets, os.path.join(output_dir, f"{prefix}_community_gene_sets.gmt"))
+    
+    # ============================================
+    # 🔬 ANALYSIS & VISUALIZATION
+    # ============================================
+    
+    # Run ssGSEA
+    ssgsea_results = run_ssgsea(
+        expression_data=expression_data,
+        gene_sets=gmt_file,
+        output_dir=output_dir
+    )
+    
+    # Process results
+    nes_wide, summary_df = process_ssgsea_results(output_dir)
+    
+    # Add interpretations
+    summary_df = interpret_enrichment_scores(summary_df)
+    
+    # Visualize results
+    plot_enrichment_heatmap(
+        nes_wide=nes_wide,
+        output_file=os.path.join(output_dir, "enrichment_heatmap.png")
+    )
+    
+    plot_community_enrichment_summary(
+        summary_df=summary_df,
+        output_file=os.path.join(output_dir, f"{title_source}_to_{title_target}_enrichment.png")
+    )
+    
+    # Print summary
+    print(f"\n📊 {title_source} → {title_target} Community Enrichment Summary:")
+    print(summary_df.to_string(index=False))
+    
+    print(f"\n✅ {title_source} → {title_target} ssGSEA analysis complete!")
+
+if __name__ == "__main__":
+    """
+    === IMPORTANT INSTRUCTIONS FOR JOURNAL READERS ===
+    
+    This code supports bidirectional analysis between healthy and disease states:
+    
+    To use this code for your analysis:
+    
+    1. DATA REQUIREMENTS:
+       - Gene expression CSV file with samples as columns and genes as rows
+       - Community assignment CSV with 'Gene Symbol' and 'Community' columns
+    
+    2. ANALYSIS SETUP:
+       a) HEALTHY → DISEASE Analysis:
+          - Set analysis_direction = "H2D" in main()
+          - Ensure you have:
+              * Healthy community assignment file (from network analysis)
+              * Disease sample gene expression data
+       
+       b) DISEASE → HEALTHY Analysis:
+          - Set analysis_direction = "D2H" in main()
+          - Ensure you have:
+              * Disease community assignment file (from network analysis)
+              * Healthy sample gene expression data
+    
+    3. INTERPRETING RESULTS:
+       - Positive ES scores indicate activation in the target condition
+       - Negative ES scores indicate suppression in the target condition
+       - Communities with strong enrichment changes are of particular interest
+    
+    4. TROUBLESHOOTING:
+       - Ensure gene symbols are consistent between files (case sensitivity)
+       - Verify column names match expected formats
+       - For large datasets, increase memory allocation if needed
+    """
+    
+    main()
