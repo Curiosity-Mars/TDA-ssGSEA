@@ -1,0 +1,536 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Gene Expression Network Analysis for Both Healthy and Disease Subjects
+====================================================
+
+This script analyzes gene expression data from either healthy or disease subjects to:
+1. Extract and preprocess gene expression data
+2. Build a correlation network of genes (correlation > 0.7)
+3. Perform community detection using Louvain algorithm
+4. Visualize the gene network with community structure
+5. Identify central genes within each community
+
+Note: The same algorithm and parameters should be applied when analyzing both healthy and disease 
+samples to ensure comparability of results. Community detection settings (resolution, minimum size) 
+should be kept consistent across analyses.
+
+Author: [Your Name]
+Date: April 2025
+"""
+
+# ============================================
+# 📦 Required Library Imports
+# ============================================
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import networkx as nx
+import community as community_louvain
+import random
+from collections import Counter
+import matplotlib.patches as mpatches
+
+# Set random seed for reproducibility
+np.random.seed(42)
+random.seed(42)
+
+# ============================================
+# 📂 Data Loading and Preprocessing
+# ============================================
+def load_and_preprocess_data(file_path, selected_samples):
+    """
+    Load and preprocess gene expression data.
+    
+    Parameters:
+    ----------
+    file_path : str
+        Path to the CSV file containing gene expression data
+    selected_samples : list
+        List of sample IDs to include in the analysis (can be healthy or disease samples)
+        
+    Returns:
+    -------
+    pandas.DataFrame
+        Preprocessed gene expression data
+    """
+    print("📊 Loading and preprocessing data...")
+    
+    # Read CSV with UTF-8-BOM encoding
+    df = pd.read_csv(file_path, encoding="utf-8-sig")
+    
+    # Clean column names (remove .CEL suffix if present)
+    df.columns = df.columns.str.replace(".CEL", "", regex=False)
+    
+    # Set gene symbols as index and drop ID column if it exists
+    df.set_index("Gene Symbol", inplace=True)
+    df.drop(columns=["ID"], inplace=True, errors="ignore")
+    
+    # Convert to numeric values
+    df = df.apply(pd.to_numeric, errors="coerce")
+    
+    # Filter for selected samples only
+    df = df[selected_samples]
+    
+    print(f"✅ Data loaded: {df.shape[0]} genes, {df.shape[1]} samples")
+    return df
+
+# ============================================
+# 🧬 Gene Selection
+# ============================================
+def select_genes(df, reference_genes, total_genes=1000):
+    """
+    Select genes for analysis, prioritizing reference genes and 
+    randomly sampling additional genes if needed.
+    
+    Parameters:
+    ----------
+    df : pandas.DataFrame
+        Gene expression data
+    reference_genes : set
+        Set of reference genes to prioritize
+    total_genes : int
+        Total number of genes to select
+        
+    Returns:
+    -------
+    list
+        Final list of selected genes
+    """
+    print("🧬 Selecting genes for analysis...")
+    
+    # Find available genes in the dataset
+    available_genes = df.index.dropna().unique()
+    
+    # Find common genes between reference list and available genes
+    common_genes = sorted(reference_genes & set(available_genes))
+    
+    # Determine how many additional genes are needed
+    extra_needed = total_genes - len(common_genes)
+    
+    # Select random additional genes if needed
+    extra_candidates = list(set(available_genes) - set(common_genes))
+    extra_genes = random.sample(extra_candidates, min(extra_needed, len(extra_candidates)))
+    
+    # Combine common and extra genes
+    final_genes = common_genes + extra_genes
+    
+    print(f"✅ Gene selection: {len(common_genes)} reference genes, "
+          f"{len(extra_genes)} additional genes, {len(final_genes)} total genes")
+    
+    return final_genes
+
+# ============================================
+# 📈 Network Construction
+# ============================================
+def build_correlation_network(df, genes, threshold=0.7):
+    """
+    Build a gene correlation network.
+    
+    Parameters:
+    ----------
+    df : pandas.DataFrame
+        Gene expression data
+    genes : list
+        List of genes to include in the network
+    threshold : float
+        Correlation threshold for adding an edge
+        
+    Returns:
+    -------
+    networkx.Graph
+        Gene correlation network
+    """
+    print(f"📈 Building correlation network (threshold: {threshold})...")
+    
+    # Filter data for selected genes
+    filtered_df = df.loc[genes]
+    
+    # Calculate correlation matrix
+    corr_matrix = filtered_df.T.corr(method="pearson")
+    
+    # Create network
+    G = nx.Graph()
+    gene_list = corr_matrix.columns.tolist()
+    
+    # Add edges for correlations above threshold
+    for i in range(len(gene_list)):
+        for j in range(i + 1, len(gene_list)):
+            val = corr_matrix.iloc[i, j]
+            if pd.notna(val) and val > threshold:
+                G.add_edge(gene_list[i], gene_list[j], weight=val)
+    
+    print(f"✅ Network built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+    return G
+
+# ============================================
+# 🌐 Community Detection
+# ============================================
+def detect_communities(G, resolution=0.05, min_community_size=4):
+    """
+    Detect communities in the network using Louvain algorithm.
+    
+    Parameters:
+    ----------
+    G : networkx.Graph
+        Gene correlation network
+    resolution : float
+        Resolution parameter for Louvain algorithm
+    min_community_size : int
+        Minimum number of nodes for a community to be kept
+        
+    Returns:
+    -------
+    tuple
+        (Updated network with small communities removed, 
+         Remapped community assignment dictionary)
+    """
+    print("🌐 Detecting communities using Louvain algorithm...")
+    
+    # Run Louvain community detection
+    partition = community_louvain.best_partition(G, resolution=resolution)
+    
+    # Count nodes in each community
+    community_counts = Counter(partition.values())
+    
+    # Identify small communities to remove
+    small_communities = {cid for cid, count in community_counts.items() 
+                         if count <= min_community_size}
+    
+    # Remove nodes from small communities
+    nodes_to_remove = [node for node, cid in partition.items() 
+                       if cid in small_communities]
+    G.remove_nodes_from(nodes_to_remove)
+    
+    # Update partition after removing nodes
+    partition = {node: cid for node, cid in partition.items() 
+                if node in G.nodes()}
+    
+    # Remap community IDs to sequential integers
+    unique_cids = sorted(set(partition.values()))
+    cid_map = {old: new for new, old in enumerate(unique_cids)}
+    remapped_partition = {node: cid_map[cid] for node, cid in partition.items()}
+    
+    print(f"✅ Communities detected: {len(set(remapped_partition.values()))} communities "
+          f"with {G.number_of_nodes()} nodes remaining")
+    
+    return G, remapped_partition
+
+# ============================================
+# 🎨 Network Visualization
+# ============================================
+def visualize_network(G, partition, output_file, show_legend=True):
+    """
+    Visualize the gene network with communities.
+    
+    Parameters:
+    ----------
+    G : networkx.Graph
+        Gene correlation network
+    partition : dict
+        Dictionary mapping nodes to community IDs
+    output_file : str
+        Filename for saving the visualization
+    show_legend : bool
+        Whether to show the community legend
+    """
+    print("🎨 Visualizing gene network...")
+    
+    plt.figure(figsize=(14, 14))
+    pos = nx.spring_layout(G, seed=42)
+    
+    # Calculate node sizes based on degree
+    node_size = [dict(G.degree())[node] * 40 for node in G.nodes()]
+    
+    # Get node colors based on community
+    node_color = [partition[node] for node in G.nodes()]
+    
+    # Use a colormap with enough colors
+    cmap = plt.get_cmap("tab20", 20)
+    
+    # Group nodes by community for ordered drawing
+    community_nodes = {}
+    for node, cid in partition.items():
+        community_nodes.setdefault(cid, []).append(node)
+    
+    # Draw larger communities first (background), smaller last (foreground)
+    sorted_cids = sorted(community_nodes.keys(), 
+                         key=lambda cid: len(community_nodes[cid]), 
+                         reverse=True)
+    
+    for cid in sorted_cids:
+        nodes = community_nodes[cid]
+        nx.draw_networkx_nodes(
+            G, pos,
+            nodelist=nodes,
+            node_size=[dict(G.degree())[node] * 40 for node in nodes],
+            node_color=[cid] * len(nodes),
+            cmap=cmap,
+            vmin=0, vmax=19
+        )
+    
+    # Draw edges and labels
+    nx.draw_networkx_edges(G, pos, alpha=0.25, edge_color='lightgray')
+    nx.draw_networkx_labels(G, pos, font_size=6)
+    
+    # Add legend if requested
+    if show_legend:
+        handles = [
+            mpatches.Patch(color=cmap(i), label=f"Community {i}")
+            for i in sorted(set(partition.values()))
+        ]
+        plt.legend(handles=handles, title="Detected Communities", 
+                  loc="upper right", fontsize=10)
+    
+    # Set title and finalize plot
+    plt.title(f"Gene Network (Healthy Only, {G.number_of_nodes()} nodes, "
+              f"{len(set(partition.values()))} communities)", fontsize=14)
+    plt.axis("off")
+    plt.tight_layout()
+    
+    # Save figure
+    plt.savefig(output_file, dpi=300)
+    print(f"✅ Network visualization saved to {output_file}")
+    
+    return plt.gcf()
+
+# ============================================
+# 📄 Export Community Assignments
+# ============================================
+def export_community_assignments(G, partition, output_file):
+    """
+    Export gene-community assignments to CSV.
+    
+    Parameters:
+    ----------
+    G : networkx.Graph
+        Gene correlation network
+    partition : dict
+        Dictionary mapping nodes to community IDs
+    output_file : str
+        Filename for saving the community assignments
+    """
+    print("📄 Exporting community assignments...")
+    
+    # Create DataFrame with gene-community mappings
+    community_df = pd.DataFrame([
+        {"Gene Symbol": gene, "Community": partition[gene]}
+        for gene in G.nodes()
+    ]).sort_values("Community").reset_index(drop=True)
+    
+    # Save to CSV
+    community_df.to_csv(output_file, index=False)
+    
+    print(f"✅ Community assignments saved to {output_file}")
+    return community_df
+
+# ============================================
+# 🧠 Identify Central Genes
+# ============================================
+def identify_central_genes(G, partition, output_file, top_n=5):
+    """
+    Identify central genes in each community using PageRank.
+    
+    Parameters:
+    ----------
+    G : networkx.Graph
+        Gene correlation network
+    partition : dict
+        Dictionary mapping nodes to community IDs
+    output_file : str
+        Filename for saving the central genes
+    top_n : int
+        Number of top genes to report per community
+    """
+    print("🧠 Identifying central genes in each community...")
+    
+    # Calculate PageRank scores
+    pagerank_scores = nx.pagerank(G)
+    
+    # Find top genes for each community
+    top_genes_per_community = []
+    
+    for cid in sorted(set(partition.values())):
+        # Get genes in this community
+        genes_in_cluster = [gene for gene, cluster_id in partition.items() 
+                          if cluster_id == cid]
+        
+        # Sort by PageRank score
+        sorted_genes = sorted(genes_in_cluster, 
+                             key=lambda x: pagerank_scores.get(x, 0), 
+                             reverse=True)
+        
+        # Add top N genes to results
+        for rank, gene in enumerate(sorted_genes[:top_n], start=1):
+            top_genes_per_community.append({
+                "Community": cid,
+                "Rank": rank,
+                "Gene Symbol": gene,
+                "PageRank Score": round(pagerank_scores[gene], 6)
+            })
+    
+    # Create DataFrame and save to CSV
+    hub_df = pd.DataFrame(top_genes_per_community)
+    hub_df.to_csv(output_file, index=False)
+    
+    print(f"✅ Central genes identified and saved to {output_file}")
+    return hub_df
+
+# ============================================
+# 🎯 Check Reference Gene Community Assignment
+# ============================================
+def analyze_reference_gene_communities(reference_genes, partition):
+    """
+    Analyze which communities reference genes belong to.
+    
+    Parameters:
+    ----------
+    reference_genes : set
+        Set of reference genes to analyze
+    partition : dict
+        Dictionary mapping nodes to community IDs
+    """
+    print("🎯 Analyzing community assignment of reference genes...")
+    
+    # Map genes to communities
+    community_gene_map = {}
+    
+    print("\nCommunity assignment of reference genes:\n")
+    for gene in sorted(reference_genes):
+        if gene in partition:
+            cid = partition[gene]
+            print(f"🧬 {gene:12s} → Community {cid}")
+            community_gene_map.setdefault(cid, []).append(gene)
+        else:
+            print(f"⚠️ {gene:12s} → Not found in the network")
+    
+    # Print summary by community
+    print("\n📦 Summary by community (only those with assigned reference genes):\n")
+    for cid, genes in sorted(community_gene_map.items()):
+        print(f"🧩 Community {cid} ({len(genes)} genes):")
+        print(", ".join(genes[:15]) + (" ..." if len(genes) > 15 else ""))
+        print()
+    
+    return community_gene_map
+
+# ============================================
+# 🚀 Main Function
+# ============================================
+def main():
+    """Main execution function."""
+    
+    # Define reference genes
+    reference_genes = {
+        "7H6", "A_33_P3400708", "Actin", "AF-6", "Akt", "aPKC", "α-Catenin", "α-Actinin", "BCL2L13",
+        "β-Catenin", "BLK", "C10orf99", "C4orf7", "CAMs", "CAPNS2", "CASK", "CCL18", "CCL19", "CCR7",
+        "CD19", "CD38", "CD99", "CDH5", "CDK4", "Cdc42", "CHI3L2", "CHP2", "CKII", "Claudins", "Cingulin",
+        "CR2", "Crumbs3", "CXCL13", "CXCL9", "CXCR4", "CXCR5", "CYP4F22", "DAPL1", "DUOX1", "ELF5", "EPAC",
+        "EVPL", "FAK", "FGFR3", "FLJ21511", "Fodrin", "Gα", "huASH1", "ICAM1", "IL2RA", "IL6", "ITGA4",
+        "ITGA4A", "ITGAL", "ITGAM", "ITGB1", "ITGB2", "IVL", "JAM", "JAM1", "JAM2", "JAM3", "JEAP",
+        "JSRP1", "LTF", "MGC29506", "MAGI1", "MAGI2", "MLC", "MLCK", "MMP9", "MS4A1", "MUPP1", "Myosin",
+        "Nox", "Occludin", "OVOL1", "PALS1", "PAR3", "PAR6", "PATJ", "PECAM1", "PI3K", "PILT", "PKC",
+        "PKCs", "PNOC", "PP2A", "PTEN", "Pyk2", "p120ctn", "p130Cas", "p38", "p40phox", "p47phox",
+        "p67phox", "Rac1", "Rab13", "Rab3B", "Rap1", "RAPL", "Ras", "Rho", "RhoA", "ROCK", "SEC6",
+        "SEC8", "SDF-1", "SHP-2", "SPA-1", "SPIB", "Src", "STX19", "Symplekin", "TCL1A", "TEC",
+        "TFCP2L1", "Thy1", "TIMD4", "TNFRSF17", "UBD", "UPK1A", "UPK1B", "VASP", "VAP33", "Vav",
+        "Vav1", "Vinculin", "VPREB3", "Yes", "ZAK", "ZNF750", "ZO-1", "ZO-2", "ZO-3", "ZONAB"
+    }
+    
+    # Example: Define sample IDs (can be either healthy or disease samples)
+    # Users should replace these with their own sample IDs
+    # For example, healthy samples from the original dataset:
+    sample_ids = [
+        "GSM298203", "GSM298204", "GSM298212",
+        "GSM298215", "GSM298216", "GSM298217"
+    ]
+    
+    # Set analysis type (for file naming)
+    analysis_type = "healthy"  # Change to "disease" when analyzing disease samples
+    
+    # File paths - input file should be a CSV with gene expression data
+    # Required format:
+    # - First column: "Gene Symbol" - contains gene identifiers
+    # - Optional column: "ID" - contains alternative identifiers (will be dropped)
+    # - Other columns: Sample IDs (e.g., GSM298203) - contain expression values
+    file_path = "GSE11783normalized_merged_by_ID.csv"  # Replace with your file
+    output_dir = "results/"
+    
+    # Output file names
+    network_vis_file = f"{output_dir}{analysis_type}_network.png"
+    network_no_legend_file = f"{output_dir}{analysis_type}_network_no_legend.png"
+    community_file = f"{output_dir}all_genes_community_assignment_{analysis_type}.csv"
+    central_genes_file = f"{output_dir}central_genes_by_community_{analysis_type}.csv"
+    gene_group_file = f"{output_dir}Group1_genes_fixed_{analysis_type}_only.csv"
+    
+    # Load and preprocess data
+    df = load_and_preprocess_data(file_path, sample_ids)
+    
+    # Select genes
+    final_genes = select_genes(df, reference_genes, total_genes=1000)
+    
+    # Save selected genes
+    group_df = pd.DataFrame({'Gene Symbol': final_genes, 'Group': 'Group 1'})
+    group_df = group_df.sort_values("Gene Symbol").reset_index(drop=True)
+    group_df.to_csv(gene_group_file, index=False)
+    print(f"✅ Selected genes saved to {gene_group_file}")
+    
+    # Build network
+    G = build_correlation_network(df, final_genes, threshold=0.7)
+    
+    # Detect communities
+    # IMPORTANT: Keep these parameters consistent when comparing healthy vs disease!
+    # The resolution parameter controls the size of communities
+    # The min_community_size parameter removes small communities for visualization clarity
+    G, remapped_partition = detect_communities(G, resolution=0.05, min_community_size=4)
+    
+    # Visualize network (with legend)
+    visualize_network(G, remapped_partition, network_vis_file, show_legend=True)
+    
+    # Visualize network (without legend)
+    visualize_network(G, remapped_partition, network_no_legend_file, show_legend=False)
+    
+    # Export community assignments
+    export_community_assignments(G, remapped_partition, community_file)
+    
+    # Identify central genes
+    identify_central_genes(G, remapped_partition, central_genes_file, top_n=5)
+    
+    # Analyze reference gene communities
+    analyze_reference_gene_communities(reference_genes, remapped_partition)
+    
+    print(f"\n✅ {analysis_type.capitalize()} analysis complete!")
+
+if __name__ == "__main__":
+    # Create output directory if it doesn't exist
+    import os
+    os.makedirs("results", exist_ok=True)
+    
+    """
+    IMPORTANT NOTES FOR USERS:
+    
+    1. Input File Format:
+       The script expects a CSV file with the following structure:
+       - First column: "Gene Symbol" (gene identifiers)
+       - Optional column: "ID" (alternative identifiers, will be dropped)
+       - Remaining columns: Sample IDs with expression values
+       
+    2. Sample Selection:
+       - You need to specify the sample IDs you want to analyze
+       - For healthy vs. disease comparison, run the analysis twice with different sample sets
+       - Remember to change the 'analysis_type' variable in the main() function
+    
+    3. Parameter Consistency:
+       - When comparing healthy and disease networks, use identical parameters for:
+         * Correlation threshold (default: 0.7)
+         * Community detection resolution (default: 0.05)
+         * Minimum community size (default: 4)
+       - This ensures fair comparison between the two conditions
+       
+    4. Memory Requirements:
+       - Large gene sets (>1000 genes) may require significant memory
+       - Consider reducing the number of genes for very large datasets
+    """
+    
+    # Run main function
+    main()
